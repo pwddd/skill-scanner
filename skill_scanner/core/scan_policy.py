@@ -470,7 +470,7 @@ class ScanPolicy:
         if not path.exists():
             raise FileNotFoundError(f"Policy file not found: {path}")
 
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             raw: dict[str, Any] = yaml.safe_load(fh) or {}
 
         # If this IS the default file, just parse directly

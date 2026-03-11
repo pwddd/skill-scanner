@@ -33,6 +33,13 @@ from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
 
 try:
     from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, UploadFile
@@ -203,6 +210,27 @@ class ScanRequest(BaseModel):
     llm_consensus_runs: int = Field(1, description="Number of LLM consensus runs (majority vote)")
 
 
+class ClawHubScanRequest(BaseModel):
+    """Request model for scanning a skill from ClawHub URL."""
+
+    clawhub_url: str = Field(..., description="ClawHub URL (e.g., https://clawhub.ai/username/project-name)")
+    policy: str | None = Field(
+        None,
+        description="Scan policy: preset name (strict, balanced, permissive) or path to custom YAML",
+    )
+    custom_rules: str | None = Field(None, description="Path to custom YARA rules directory")
+    use_llm: bool = Field(False, description="Enable LLM analyzer")
+    llm_provider: str | None = Field("anthropic", description="LLM provider (anthropic or openai)")
+    use_behavioral: bool = Field(False, description="Enable behavioral analyzer")
+    use_virustotal: bool = Field(False, description="Enable VirusTotal binary file scanning")
+    vt_upload_files: bool = Field(False, description="Upload unknown files to VirusTotal")
+    use_aidefense: bool = Field(False, description="Enable AI Defense analyzer")
+    aidefense_api_url: str | None = Field(None, description="AI Defense API URL")
+    use_trigger: bool = Field(False, description="Enable trigger specificity analysis")
+    enable_meta: bool = Field(False, description="Enable meta-analysis for false positive filtering")
+    llm_consensus_runs: int = Field(1, description="Number of LLM consensus runs (majority vote)")
+
+
 class ScanResponse(BaseModel):
     """Response model for scan results."""
 
@@ -301,6 +329,188 @@ def _build_analyzers(
         use_trigger=use_trigger,
         llm_consensus_runs=llm_consensus_runs,
     )
+
+
+def _extract_slug_from_clawhub_url(url: str) -> str:
+    """Extract the project slug from a ClawHub URL.
+    
+    Args:
+        url: ClawHub URL (e.g., https://clawhub.ai/username/project-name)
+        
+    Returns:
+        Project slug (e.g., project-name)
+        
+    Raises:
+        ValueError: If URL format is invalid
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.netloc != "clawhub.ai":
+            raise ValueError(f"Invalid ClawHub URL: expected clawhub.ai domain, got {parsed.netloc}")
+        
+        path_parts = [p for p in parsed.path.split("/") if p]
+        if len(path_parts) < 2:
+            raise ValueError(f"Invalid ClawHub URL format: expected /username/project-name, got {parsed.path}")
+        
+        # Return the last part as the slug (project name)
+        return path_parts[-1]
+    except Exception as e:
+        raise ValueError(f"Failed to parse ClawHub URL: {e}")
+
+
+async def _download_clawhub_package(slug: str) -> Path:
+    """Download a skill package from ClawHub.
+    
+    Args:
+        slug: Project slug from ClawHub URL
+        
+    Returns:
+        Path to downloaded ZIP file
+        
+    Raises:
+        HTTPException: If download fails
+    """
+    if not HTTPX_AVAILABLE:
+        raise HTTPException(
+            status_code=500,
+            detail="httpx library is required for ClawHub downloads. Install with: pip install httpx"
+        )
+    
+    # Get download URL prefix from environment variable
+    download_prefix = os.environ.get(
+        "CLAWHUB_DOWNLOAD_URL_PREFIX",
+        "https://wry-manatee-359.convex.site/api/v1/download"
+    )
+    
+    download_url = f"{download_prefix}?slug={slug}"
+    
+    temp_dir = Path(tempfile.mkdtemp(prefix="clawhub_download_"))
+    zip_path = temp_dir / f"{slug}.zip"
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            logger.info(f"Downloading ClawHub package from: {download_url}")
+            response = await client.get(download_url, follow_redirects=True)
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Failed to download from ClawHub: HTTP {response.status_code}"
+                )
+            
+            # Check content type
+            content_type = response.headers.get("content-type", "")
+            if "application/zip" not in content_type and "application/octet-stream" not in content_type:
+                logger.warning(f"Unexpected content type: {content_type}")
+            
+            # Check size limit
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > MAX_UPLOAD_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Package size exceeds maximum of {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB"
+                )
+            
+            # Write to file
+            total_written = 0
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    total_written += len(chunk)
+                    if total_written > MAX_UPLOAD_SIZE_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Package size exceeds maximum of {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB"
+                        )
+                    f.write(chunk)
+            
+            logger.info(f"Downloaded {total_written} bytes to {zip_path}")
+            return zip_path
+            
+    except httpx.HTTPError as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to download from ClawHub: {str(e)}"
+        )
+    except HTTPException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error during download: {str(e)}"
+        )
+
+
+def _extract_and_validate_zip(zip_path: Path, temp_dir: Path) -> Path:
+    """Extract and validate a ZIP file, returning the skill directory.
+    
+    This is shared logic used by both scan_uploaded_skill and scan_clawhub_skill.
+    
+    Args:
+        zip_path: Path to the ZIP file
+        temp_dir: Temporary directory for extraction
+        
+    Returns:
+        Path to the extracted skill directory (containing SKILL.md)
+        
+    Raises:
+        HTTPException: If validation or extraction fails
+    """
+    import stat
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            # Enforce entry count and uncompressed size limits
+            entries = [info for info in zip_ref.infolist() if not info.is_dir()]
+            if len(entries) > MAX_ZIP_ENTRIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ZIP contains {len(entries)} files, exceeding limit of {MAX_ZIP_ENTRIES}",
+                )
+            total_uncompressed = sum(info.file_size for info in entries)
+            if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"ZIP uncompressed size ({total_uncompressed // (1024 * 1024)} MB) "
+                        f"exceeds limit of {MAX_ZIP_UNCOMPRESSED_BYTES // (1024 * 1024)} MB"
+                    ),
+                )
+            # Check for path traversal and symlinks using resolved extraction targets.
+            extract_root = (temp_dir / "extracted").resolve()
+            for info in zip_ref.infolist():
+                # Reject symlink entries — they can escape the extraction directory
+                unix_mode = (info.external_attr >> 16) & 0xFFFF
+                if unix_mode != 0 and stat.S_ISLNK(unix_mode):
+                    raise HTTPException(status_code=400, detail="ZIP contains symbolic link entries")
+                dest_path = (extract_root / info.filename).resolve()
+                if not dest_path.is_relative_to(extract_root):
+                    raise HTTPException(status_code=400, detail="ZIP contains path traversal entries")
+
+            # Extract member-by-member, verifying no symlink appears on disk
+            extract_root.mkdir(parents=True, exist_ok=True)
+            for info in zip_ref.infolist():
+                zip_ref.extract(info, extract_root)
+                dest_path = (extract_root / info.filename).resolve()
+                if dest_path.is_symlink():
+                    dest_path.unlink()
+                    raise HTTPException(
+                        status_code=400,
+                        detail="ZIP extraction produced a symbolic link — rejected",
+                    )
+    except zipfile.BadZipFile as e:
+        raise HTTPException(status_code=400, detail="Invalid ZIP archive") from e
+
+    extracted_dir = temp_dir / "extracted"
+    skill_dirs = list(extracted_dir.rglob("SKILL.md"))
+
+    if not skill_dirs:
+        raise HTTPException(status_code=400, detail="No SKILL.md found in archive")
+
+    return skill_dirs[0].parent
 
 
 def _recompute_report_summary(report) -> None:
@@ -513,59 +723,8 @@ async def scan_uploaded_skill(
                     )
                 f.write(chunk)
 
-        import stat
-        import zipfile
-
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                # Enforce entry count and uncompressed size limits
-                entries = [info for info in zip_ref.infolist() if not info.is_dir()]
-                if len(entries) > MAX_ZIP_ENTRIES:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"ZIP contains {len(entries)} files, exceeding limit of {MAX_ZIP_ENTRIES}",
-                    )
-                total_uncompressed = sum(info.file_size for info in entries)
-                if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"ZIP uncompressed size ({total_uncompressed // (1024 * 1024)} MB) "
-                            f"exceeds limit of {MAX_ZIP_UNCOMPRESSED_BYTES // (1024 * 1024)} MB"
-                        ),
-                    )
-                # Check for path traversal and symlinks using resolved extraction targets.
-                extract_root = (temp_dir / "extracted").resolve()
-                for info in zip_ref.infolist():
-                    # Reject symlink entries — they can escape the extraction directory
-                    unix_mode = (info.external_attr >> 16) & 0xFFFF
-                    if unix_mode != 0 and stat.S_ISLNK(unix_mode):
-                        raise HTTPException(status_code=400, detail="ZIP contains symbolic link entries")
-                    dest_path = (extract_root / info.filename).resolve()
-                    if not dest_path.is_relative_to(extract_root):
-                        raise HTTPException(status_code=400, detail="ZIP contains path traversal entries")
-
-                # Extract member-by-member, verifying no symlink appears on disk
-                extract_root.mkdir(parents=True, exist_ok=True)
-                for info in zip_ref.infolist():
-                    zip_ref.extract(info, extract_root)
-                    dest_path = (extract_root / info.filename).resolve()
-                    if dest_path.is_symlink():
-                        dest_path.unlink()
-                        raise HTTPException(
-                            status_code=400,
-                            detail="ZIP extraction produced a symbolic link — rejected",
-                        )
-        except zipfile.BadZipFile as e:
-            raise HTTPException(status_code=400, detail="Invalid ZIP archive") from e
-
-        extracted_dir = temp_dir / "extracted"
-        skill_dirs = list(extracted_dir.rglob("SKILL.md"))
-
-        if not skill_dirs:
-            raise HTTPException(status_code=400, detail="No SKILL.md found in uploaded archive")
-
-        skill_dir = skill_dirs[0].parent
+        # Use shared extraction and validation logic
+        skill_dir = _extract_and_validate_zip(zip_path, temp_dir)
 
         request = ScanRequest(
             skill_directory=str(skill_dir),
@@ -584,6 +743,56 @@ async def scan_uploaded_skill(
         )
 
         return await scan_skill(request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@router.post("/scan-clawhub", response_model=ScanResponse)
+async def scan_clawhub_skill(
+    request: ClawHubScanRequest,
+    vt_api_key: str | None = Header(None, alias="X-VirusTotal-Key"),
+    aidefense_api_key: str | None = Header(None, alias="X-AIDefense-Key"),
+):
+    """Scan a skill package from ClawHub URL.
+    
+    This endpoint downloads a skill package from ClawHub and scans it.
+    The ClawHub URL should be in the format: https://clawhub.ai/username/project-name
+    
+    The download URL is constructed using the CLAWHUB_DOWNLOAD_URL_PREFIX environment variable
+    (defaults to https://wry-manatee-359.convex.site/api/v1/download) with the project slug.
+    """
+    # Extract slug from ClawHub URL
+    try:
+        slug = _extract_slug_from_clawhub_url(request.clawhub_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Download the package to a temporary ZIP file
+    zip_path = await _download_clawhub_package(slug)
+    temp_dir = zip_path.parent
+    
+    try:
+        # Reuse the same extraction and scanning logic as scan_uploaded_skill
+        skill_dir = _extract_and_validate_zip(zip_path, temp_dir)
+
+        scan_request = ScanRequest(
+            skill_directory=str(skill_dir),
+            policy=request.policy,
+            custom_rules=request.custom_rules,
+            use_llm=request.use_llm,
+            llm_provider=request.llm_provider,
+            use_behavioral=request.use_behavioral,
+            use_virustotal=request.use_virustotal,
+            vt_upload_files=request.vt_upload_files,
+            use_aidefense=request.use_aidefense,
+            aidefense_api_url=request.aidefense_api_url,
+            use_trigger=request.use_trigger,
+            enable_meta=request.enable_meta,
+            llm_consensus_runs=request.llm_consensus_runs,
+        )
+
+        return await scan_skill(scan_request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

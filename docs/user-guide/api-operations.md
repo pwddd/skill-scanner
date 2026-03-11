@@ -1,6 +1,6 @@
 # API Operations
 
-Production deployment, CI/CD integration, security hardening, monitoring, and troubleshooting for the Skill Scanner API server. For endpoint documentation, see [API Endpoints Detail](api-endpoints-detail.md).
+Production deployment, CI/CD integration, security hardening, monitoring, and troubleshooting for the Skill Scanner API server. For endpoint documentation, see [API Endpoints Detail](api-endpoints-detail.md). For ClawHub URL scanning, see [ClawHub Scanning](clawhub-scanning.md).
 
 ## CI/CD Integration
 
@@ -46,6 +46,32 @@ jobs:
 
           # Check for critical findings
           CRITICAL=$(jq '.result.summary.findings_by_severity.critical' results.json)
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "Critical findings detected!"
+            exit 1
+          fi
+
+  scan-clawhub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start API Server
+        run: |
+          pip install cisco-ai-skill-scanner
+          export CLAWHUB_DOWNLOAD_URL_PREFIX=https://wry-manatee-359.convex.site/api/v1/download
+          skill-scanner-api &
+          sleep 5
+
+      - name: Scan ClawHub Skill
+        run: |
+          curl -X POST http://localhost:8000/scan-clawhub \
+            -H "Content-Type: application/json" \
+            -d '{
+              "clawhub_url": "https://clawhub.ai/username/project-name",
+              "policy": "strict"
+            }' > results.json
+
+          # Check for critical findings
+          CRITICAL=$(jq '.findings | map(select(.severity == "CRITICAL")) | length' results.json)
           if [ "$CRITICAL" -gt 0 ]; then
             echo "Critical findings detected!"
             exit 1
