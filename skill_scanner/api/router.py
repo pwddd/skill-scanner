@@ -224,6 +224,7 @@ class ClawHubScanRequest(BaseModel):
     use_behavioral: bool = Field(False, description="Enable behavioral analyzer")
     use_virustotal: bool = Field(False, description="Enable VirusTotal binary file scanning")
     vt_upload_files: bool = Field(False, description="Upload unknown files to VirusTotal")
+    use_zip_virus: bool = Field(False, description="Enable ZIP package virus scanning via VirusTotal")
     use_aidefense: bool = Field(False, description="Enable AI Defense analyzer")
     aidefense_api_url: str | None = Field(None, description="AI Defense API URL")
     use_trigger: bool = Field(False, description="Enable trigger specificity analysis")
@@ -692,6 +693,7 @@ async def scan_uploaded_skill(
     use_virustotal: bool = Form(False, description="Enable VirusTotal scanner"),
     vt_api_key: str | None = Header(None, alias="X-VirusTotal-Key"),
     vt_upload_files: bool = Form(False, description="Upload unknown files to VirusTotal"),
+    use_zip_virus: bool = Form(False, description="Enable ZIP package virus scanning"),
     use_aidefense: bool = Form(False, description="Enable AI Defense analyzer"),
     aidefense_api_key: str | None = Header(None, alias="X-AIDefense-Key"),
     aidefense_api_url: str | None = Form(None, description="AI Defense API URL"),
@@ -723,6 +725,36 @@ async def scan_uploaded_skill(
                     )
                 f.write(chunk)
 
+        # If ZIP virus scanning is enabled, scan the ZIP file before extraction
+        zip_virus_findings = []
+        if use_zip_virus:
+            try:
+                from ..core.analyzers.zip_virus_analyzer import ZipVirusAnalyzer
+                from ..core.models import Skill, SkillFile, SkillManifest
+                
+                key = vt_api_key or os.getenv("VIRUSTOTAL_API_KEY")
+                if key:
+                    temp_skill_md = temp_dir / "SKILL.md"
+                    temp_skill_md.write_text(f"---\nname: {file.filename}\ndescription: ZIP scanning\n---\n", encoding="utf-8")
+                    
+                    zip_skill = Skill(
+                        directory=temp_dir,
+                        manifest=SkillManifest(name=file.filename, description="ZIP scanning"),
+                        skill_md_path=temp_skill_md,
+                        instruction_body="",
+                        files=[SkillFile(
+                            path=zip_path,
+                            relative_path=zip_path.name,
+                            file_type='binary',
+                            size_bytes=zip_path.stat().st_size
+                        )]
+                    )
+                    
+                    zip_analyzer = ZipVirusAnalyzer(api_key=key, enabled=True, upload_files=vt_upload_files)
+                    zip_virus_findings = zip_analyzer.analyze(zip_skill)
+            except Exception as e:
+                logger.warning("ZIP virus scan failed: %s", e)
+
         # Use shared extraction and validation logic
         skill_dir = _extract_and_validate_zip(zip_path, temp_dir)
 
@@ -742,7 +774,18 @@ async def scan_uploaded_skill(
             llm_consensus_runs=llm_consensus_runs,
         )
 
-        return await scan_skill(request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
+        response = await scan_skill(request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
+        
+        # Merge ZIP virus findings
+        if zip_virus_findings:
+            response.findings.extend([f.to_dict() for f in zip_virus_findings])
+            response.findings_count = len(response.findings)
+            from ..core.models import Severity
+            all_severities = [Severity(f["severity"]) for f in response.findings]
+            response.max_severity = max(all_severities, default=Severity.INFO).value
+            response.is_safe = all(s <= Severity.INFO for s in all_severities)
+        
+        return response
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -773,6 +816,36 @@ async def scan_clawhub_skill(
     temp_dir = zip_path.parent
     
     try:
+        # If ZIP virus scanning is enabled, scan the ZIP file before extraction
+        zip_virus_findings = []
+        if request.use_zip_virus:
+            try:
+                from ..core.analyzers.zip_virus_analyzer import ZipVirusAnalyzer
+                from ..core.models import Skill, SkillFile, SkillManifest
+                
+                key = vt_api_key or os.getenv("VIRUSTOTAL_API_KEY")
+                if key:
+                    temp_skill_md = temp_dir / "SKILL.md"
+                    temp_skill_md.write_text(f"---\nname: {slug}\ndescription: ZIP scanning\n---\n", encoding="utf-8")
+                    
+                    zip_skill = Skill(
+                        directory=temp_dir,
+                        manifest=SkillManifest(name=slug, description="ZIP scanning"),
+                        skill_md_path=temp_skill_md,
+                        instruction_body="",
+                        files=[SkillFile(
+                            path=zip_path,
+                            relative_path=zip_path.name,
+                            file_type='binary',
+                            size_bytes=zip_path.stat().st_size
+                        )]
+                    )
+                    
+                    zip_analyzer = ZipVirusAnalyzer(api_key=key, enabled=True, upload_files=request.vt_upload_files)
+                    zip_virus_findings = zip_analyzer.analyze(zip_skill)
+            except Exception as e:
+                logger.warning("ZIP virus scan failed: %s", e)
+        
         # Reuse the same extraction and scanning logic as scan_uploaded_skill
         skill_dir = _extract_and_validate_zip(zip_path, temp_dir)
 
@@ -792,7 +865,18 @@ async def scan_clawhub_skill(
             llm_consensus_runs=request.llm_consensus_runs,
         )
 
-        return await scan_skill(scan_request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
+        response = await scan_skill(scan_request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
+        
+        # Merge ZIP virus findings
+        if zip_virus_findings:
+            response.findings.extend([f.to_dict() for f in zip_virus_findings])
+            response.findings_count = len(response.findings)
+            from ..core.models import Severity
+            all_severities = [Severity(f["severity"]) for f in response.findings]
+            response.max_severity = max(all_severities, default=Severity.INFO).value
+            response.is_safe = all(s <= Severity.INFO for s in all_severities)
+        
+        return response
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

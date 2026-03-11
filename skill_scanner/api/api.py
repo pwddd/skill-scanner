@@ -19,10 +19,35 @@
 This module provides a FastAPI application for scanning agent skills packages.
 """
 
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from .. import __version__ as PACKAGE_VERSION
 from .router import router as api_router
+
+# Load .env file with priority: current dir -> home dir -> parent dirs
+def _load_env_file():
+    """Load .env file from multiple possible locations."""
+    search_paths = [
+        Path.cwd() / ".env",  # Current working directory
+        Path.home() / ".env",  # User home directory
+    ]
+    
+    # Add parent directories (up to 3 levels)
+    current = Path.cwd()
+    for _ in range(3):
+        current = current.parent
+        search_paths.append(current / ".env")
+    
+    for env_path in search_paths:
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+            break
+
+_load_env_file()
 
 app = FastAPI(
     title="Skill Scanner API",
