@@ -107,9 +107,18 @@ def _build_analyzers(policy: ScanPolicy, args: argparse.Namespace, status: Calla
     Delegates to the centralized :func:`build_analyzers` factory so that
     core analyzer construction is defined in exactly one place.
     """
+    from ..data import resolve_rule_packs
+
+    extra_rules_dirs = None
+    pack_names: list[str] | None = getattr(args, "rule_packs", None)
+    if pack_names:
+        extra_rules_dirs = resolve_rule_packs(pack_names)
+        status(f"Loading additional rule packs: {', '.join(pack_names)}")
+
     analyzers = build_analyzers(
         policy,
         custom_yara_rules_path=getattr(args, "custom_rules", None),
+        extra_rules_dirs=extra_rules_dirs,
         use_behavioral=getattr(args, "use_behavioral", False),
         use_llm=getattr(args, "use_llm", False),
         use_virustotal=getattr(args, "use_virustotal", False),
@@ -291,11 +300,12 @@ def _write_output(args: argparse.Namespace, output: str) -> None:
     primary_fmt = formats[0] if formats else "summary"
     render_md = sys.stdout.isatty() and not getattr(args, "no_render_markdown", False)
 
-    # Primary format: write to --output file or stdout
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
+    # Primary format: --output-<fmt> (explicit) > --output (generic) > stdout
+    primary_file = getattr(args, f"output_{primary_fmt}", None) or args.output
+    if primary_file:
+        with open(primary_file, "w", encoding="utf-8") as fh:
             fh.write(output)
-        print(f"Report saved to: {args.output}")
+        print(f"Report saved to: {primary_file}")
     else:
         if primary_fmt == "markdown" and render_md:
             Console().print(Markdown(output))
@@ -328,8 +338,28 @@ def _write_output(args: argparse.Namespace, output: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _handle_rule_packs_list(args: argparse.Namespace) -> bool:
+    """If ``--rule-packs list`` was passed, print available packs and return True."""
+    pack_names: list[str] | None = getattr(args, "rule_packs", None)
+    if pack_names and pack_names == ["list"]:
+        from ..data import list_available_packs
+
+        packs = list_available_packs()
+        if packs:
+            print("Available rule packs:")
+            for p in packs:
+                print(f"  - {p}")
+        else:
+            print("No additional rule packs available.")
+        return True
+    return False
+
+
 def scan_command(args: argparse.Namespace) -> int:
     """Handle the ``scan`` command for a single skill."""
+    if _handle_rule_packs_list(args):
+        return 0
+
     skill_dir = Path(args.skill_directory)
     if not skill_dir.exists():
         print(f"Error: Directory does not exist: {skill_dir}", file=sys.stderr)
@@ -349,15 +379,16 @@ def scan_command(args: argparse.Namespace) -> int:
 
     scanner = SkillScanner(analyzers=analyzers, policy=policy)
     lenient = getattr(args, "lenient", False)
+    skill_file = getattr(args, "skill_file", None)
 
     try:
-        result = scanner.scan_skill(skill_dir, lenient=lenient)
+        result = scanner.scan_skill(skill_dir, lenient=lenient, skill_file=skill_file)
 
         # Meta-analysis
         if meta_analyzer and result.findings and apply_meta_analysis_to_results is not None:
             status("Running meta-analysis to filter false positives...")
             try:
-                skill = scanner.loader.load_skill(skill_dir, lenient=lenient)
+                skill = scanner.loader.load_skill(skill_dir, lenient=lenient, skill_file=skill_file)
                 original_count = len(result.findings)
                 meta_result = asyncio.run(
                     meta_analyzer.analyze_with_findings(
@@ -416,6 +447,9 @@ def scan_command(args: argparse.Namespace) -> int:
 
 def scan_all_command(args: argparse.Namespace) -> int:
     """Handle the ``scan-all`` command for multiple skills."""
+    if _handle_rule_packs_list(args):
+        return 0
+
     skills_dir = Path(args.skills_directory)
     if not skills_dir.exists():
         print(f"Error: Directory does not exist: {skills_dir}", file=sys.stderr)
@@ -436,11 +470,16 @@ def scan_all_command(args: argparse.Namespace) -> int:
     scanner = SkillScanner(analyzers=analyzers, policy=policy)
 
     lenient = getattr(args, "lenient", False)
+    skill_file = getattr(args, "skill_file", None)
 
     try:
         check_overlap = getattr(args, "check_overlap", False)
         report = scanner.scan_directory(
-            skills_dir, recursive=args.recursive, check_overlap=check_overlap, lenient=lenient
+            skills_dir,
+            recursive=args.recursive,
+            check_overlap=check_overlap,
+            lenient=lenient,
+            skill_file=skill_file,
         )
 
         if report.total_skills_scanned == 0:
@@ -455,7 +494,9 @@ def scan_all_command(args: argparse.Namespace) -> int:
                 if not result.findings:
                     continue
                 try:
-                    skill = scanner.loader.load_skill(Path(result.skill_directory), lenient=lenient)
+                    skill = scanner.loader.load_skill(
+                        Path(result.skill_directory), lenient=lenient, skill_file=skill_file
+                    )
                     original_count = len(result.findings)
                     meta_result = asyncio.run(
                         meta_analyzer.analyze_with_findings(
@@ -707,12 +748,14 @@ def _add_common_scan_flags(parser: argparse.ArgumentParser) -> None:
             "Use 'sarif' for GitHub Code Scanning, 'html' for interactive report."
         ),
     )
-    parser.add_argument("--output", "-o", help="Output file path (for the first --format)")
-    parser.add_argument("--output-json", help="Write JSON report to this file (when using multiple --format)")
-    parser.add_argument("--output-sarif", help="Write SARIF report to this file (when using multiple --format)")
-    parser.add_argument("--output-markdown", help="Write Markdown report to this file (when using multiple --format)")
-    parser.add_argument("--output-html", help="Write HTML report to this file (when using multiple --format)")
-    parser.add_argument("--output-table", help="Write Table report to this file (when using multiple --format)")
+    parser.add_argument(
+        "--output", "-o", help="Default output file path (overridden by --output-<fmt> for a specific format)"
+    )
+    parser.add_argument("--output-json", help="Write JSON report to this file")
+    parser.add_argument("--output-sarif", help="Write SARIF report to this file")
+    parser.add_argument("--output-markdown", help="Write Markdown report to this file")
+    parser.add_argument("--output-html", help="Write HTML report to this file")
+    parser.add_argument("--output-table", help="Write Table report to this file")
     parser.add_argument("--detailed", action="store_true", help="Include detailed findings (Markdown output only)")
     parser.add_argument(
         "--no-render-markdown",
@@ -766,12 +809,27 @@ def _add_common_scan_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--lenient",
         action="store_true",
-        help="Tolerate malformed skills: coerce bad fields, fill defaults, and continue instead of failing",
+        help=(
+            "Tolerate malformed skills: coerce bad fields, fill defaults, and continue instead of failing. "
+            "When SKILL.md is absent, falls back to scanning .md files in the directory as instruction bodies "
+            "(supports non-Codex/Cursor formats such as Claude Code commands)."
+        ),
+    )
+    parser.add_argument(
+        "--skill-file",
+        metavar="FILENAME",
+        help="Custom metadata filename to use instead of SKILL.md (e.g. README.md)",
     )
     parser.add_argument(
         "--custom-rules",
         metavar="PATH",
         help="Path to directory containing custom YARA rules (.yara files)",
+    )
+    parser.add_argument(
+        "--rule-packs",
+        nargs="+",
+        metavar="PACK",
+        help="Additional signature rule packs to enable (e.g. 'atr'). Use '--rule-packs list' to show available packs.",
     )
     parser.add_argument(
         "--taxonomy",
